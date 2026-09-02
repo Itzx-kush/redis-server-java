@@ -11,14 +11,62 @@ import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
+import java.util.HashMap;
 
 public class Main {
 
+    private static boolean isReplica = false;
+    private static final List<Socket> replicas =
+            new CopyOnWriteArrayList<>();
+
+    private static final Map<Socket, Long> replicaAckOffsets =
+            new ConcurrentHashMap<>();
+
+    private static final Object replicationLock = new Object();
+
+    private static int serverPort = 6379;
+    private static long replicaOffset = 0;
+
+    private static String masterHost;
+    private static int masterPort;
+
+    private static final String masterReplId =
+            "8371b4fb1155b71f4a04d3e1bc3e18c4a990aeeb";
+
+    private static long masterReplOffset = 0;
+
+    private static final byte[] EMPTY_RDB = {
+            0x52, 0x45, 0x44, 0x49, 0x53, 0x30, 0x30, 0x31, 0x31,
+            (byte) 0xFA, 0x09,
+            0x72, 0x65, 0x64, 0x69, 0x73, 0x2D, 0x76, 0x65, 0x72,
+            0x05,
+            0x37, 0x2E, 0x32, 0x2E, 0x30,
+            (byte) 0xFA, 0x0A,
+            0x72, 0x65, 0x64, 0x69, 0x73, 0x2D, 0x62, 0x69, 0x74, 0x73,
+            (byte) 0xC0, 0x40,
+            (byte) 0xFA, 0x05,
+            0x63, 0x74, 0x69, 0x6D, 0x65,
+            (byte) 0xC2, 0x6D, 0x08, (byte) 0xBC, 0x65,
+            (byte) 0xFA, 0x08,
+            0x75, 0x73, 0x65, 0x64, 0x2D, 0x6D, 0x65, 0x6D,
+            (byte) 0xB0, (byte) 0xC4, 0x10, 0x00,
+            (byte) 0xFA, 0x08,
+            0x61, 0x6F, 0x66, 0x2D, 0x62, 0x61, 0x73, 0x65,
+            (byte) 0xC0, 0x00,
+            (byte) 0xFF,
+            (byte) 0xF0, 0x6E, 0x3B, (byte) 0xFE,
+            (byte) 0xC0, (byte) 0xFF, 0x5A, (byte) 0xA2,
+            0x00
+    };
     private static final Map<String, String> store =
             new ConcurrentHashMap<>();
 
     private static final Map<String, Long> expiryTimes =
+            new ConcurrentHashMap<>();
+
+    private static final Map<String, Long> keyVersions =
             new ConcurrentHashMap<>();
 
     private static final Map<String, List<String>> lists =
@@ -191,14 +239,46 @@ public class Main {
 
         return response.toString();
     }
+    private static long getKeyVersion(String key) {
+        return keyVersions.getOrDefault(key, 0L);
+    }
+
+    private static void markKeyModified(String key) {
+        keyVersions.merge(key, 1L, Long::sum);
+    }
     public static void main(String[] args) {
         System.out.println("Logs from your program will appear here!");
 
-        int port = 6379;
+        serverPort = 6379;
+
+        for (int i = 0; i < args.length; i++) {
+
+            if (args[i].equals("--port") && i + 1 < args.length) {
+                serverPort = Integer.parseInt(args[i + 1]);
+            }
+
+            if (args[i].equals("--replicaof") && i + 1 < args.length) {
+                isReplica = true;
+
+                String[] masterInfo = args[i + 1].split(" ");
+
+                masterHost = masterInfo[0];
+                masterPort = Integer.parseInt(masterInfo[1]);
+
+                i++;
+            }
+        }
 
         try {
-            ServerSocket serverSocket = new ServerSocket(port);
+            ServerSocket serverSocket = new ServerSocket(serverPort);
             serverSocket.setReuseAddress(true);
+
+            if (isReplica) {
+                Thread handshakeThread =
+                        new Thread(Main::performReplicationHandshake);
+
+                handshakeThread.start();
+            }
 
             // Accept multiple clients.
             while (true) {
@@ -216,14 +296,289 @@ public class Main {
             );
         }
     }
+    private static void performReplicationHandshake() {
+
+        try {
+
+            Socket masterSocket =
+                    new Socket(masterHost, masterPort);
+
+            InputStream input =
+                    masterSocket.getInputStream();
+
+            // ---------------------------------
+            // 1. PING
+            // ---------------------------------
+
+            String ping =
+                    "*1\r\n" +
+                            "$4\r\n" +
+                            "PING\r\n";
+
+            masterSocket.getOutputStream().write(
+                    ping.getBytes(StandardCharsets.UTF_8)
+            );
+
+            System.out.println("Replica sent PING to master");
+
+            readLine(input);
+
+            System.out.println("Replica received PONG from master");
+
+
+            // ---------------------------------
+            // 2. REPLCONF listening-port
+            // ---------------------------------
+
+            String portString = String.valueOf(serverPort);
+
+            String replconfPort =
+                    "*3\r\n" +
+                            "$8\r\n" +
+                            "REPLCONF\r\n" +
+                            "$14\r\n" +
+                            "listening-port\r\n" +
+                            "$" + portString.length() + "\r\n" +
+                            portString +
+                            "\r\n";
+
+            masterSocket.getOutputStream().write(
+                    replconfPort.getBytes(StandardCharsets.UTF_8)
+            );
+
+            System.out.println(
+                    "Replica sent REPLCONF listening-port"
+            );
+
+            readLine(input);
+
+            System.out.println(
+                    "Replica received REPLCONF OK"
+            );
+
+
+            // ---------------------------------
+            // 3. REPLCONF capa psync2
+            // ---------------------------------
+
+            String replconfCapa =
+                    "*3\r\n" +
+                            "$8\r\n" +
+                            "REPLCONF\r\n" +
+                            "$4\r\n" +
+                            "capa\r\n" +
+                            "$6\r\n" +
+                            "psync2\r\n";
+
+            masterSocket.getOutputStream().write(
+                    replconfCapa.getBytes(StandardCharsets.UTF_8)
+            );
+
+            System.out.println(
+                    "Replica sent REPLCONF capa psync2"
+            );
+
+            readLine(input);
+
+            System.out.println(
+                    "Replica received REPLCONF OK"
+            );
+            // ---------------------------------
+// 4. PSYNC ? -1
+// ---------------------------------
+
+            String psync =
+                    "*3\r\n" +
+                            "$5\r\n" +
+                            "PSYNC\r\n" +
+                            "$1\r\n" +
+                            "?\r\n" +
+                            "$2\r\n" +
+                            "-1\r\n";
+
+            masterSocket.getOutputStream().write(
+                    psync.getBytes(StandardCharsets.UTF_8)
+            );
+
+            System.out.println(
+                    "Replica sent PSYNC ? -1"
+            );
+
+            readLine(input);
+
+            System.out.println(
+                    "Replica received FULLRESYNC"
+            );
+
+// Read RDB header
+            String rdbHeader = readLine(input);
+
+            if (rdbHeader != null && rdbHeader.startsWith("$")) {
+
+                int rdbLength =
+                        Integer.parseInt(rdbHeader.substring(1));
+
+                // Read the complete RDB payload
+                byte[] rdbData =
+                        input.readNBytes(rdbLength);
+
+                System.out.println(
+                        "Replica received RDB: "
+                                + rdbData.length
+                                + " bytes"
+                );
+            }
+
+// Keep the replication connection open
+// and listen for commands from the master.
+            while (true) {
+
+                String arrayHeader = readLine(input);
+
+                if (arrayHeader == null) {
+                    break;
+                }
+
+                if (!arrayHeader.startsWith("*")) {
+                    break;
+                }
+
+                int argumentCount =
+                        Integer.parseInt(arrayHeader.substring(1));
+
+                String[] arguments =
+                        new String[argumentCount];
+
+                int commandBytes =
+                        arrayHeader.getBytes(StandardCharsets.UTF_8).length + 2;
+
+                for (int i = 0; i < argumentCount; i++) {
+
+                    String argument =
+                            readBulkString(input);
+
+                    arguments[i] = argument;
+
+                    byte[] argumentBytes =
+                            argument.getBytes(StandardCharsets.UTF_8);
+
+                    commandBytes +=
+                            ("$" + argumentBytes.length + "\r\n")
+                                    .getBytes(StandardCharsets.UTF_8).length;
+
+                    commandBytes +=
+                            argumentBytes.length + 2;
+                }
+
+                if (arguments.length == 0) {
+                    continue;
+                }
+
+                String command = arguments[0];
+                if (command.equalsIgnoreCase("REPLCONF")&& arguments.length == 3
+                        && arguments[1].equalsIgnoreCase("GETACK")
+                        && arguments[2].equals("*")) {
+
+                    String offsetString =
+                            String.valueOf(replicaOffset);
+
+                    String response =
+                            "*3\r\n" +
+                                    "$8\r\n" +
+                                    "REPLCONF\r\n" +
+                                    "$3\r\n" +
+                                    "ACK\r\n" +
+                                    "$" + offsetString.length() + "\r\n" +
+                                    offsetString +
+                                    "\r\n";
+
+                    masterSocket.getOutputStream().write(
+                            response.getBytes(StandardCharsets.UTF_8)
+                    );
+
+                    System.out.println(
+                            "Replica sent ACK " + replicaOffset
+                    );
+
+                    // Count this GETACK command only after
+                    // sending the ACK for the current offset.
+                    replicaOffset += commandBytes;
+
+                    continue;
+                }
+
+                else if (command.equalsIgnoreCase("SET")
+                        && arguments.length >= 3) {
+
+                    String key = arguments[1];
+                    String value = arguments[2];
+
+                    store.put(key, value);
+
+                    if (arguments.length >= 5
+                            && arguments[3].equalsIgnoreCase("PX")) {
+
+                        long milliseconds =
+                                Long.parseLong(arguments[4]);
+
+                        expiryTimes.put(
+                                key,
+                                System.currentTimeMillis() + milliseconds
+                        );
+
+                    } else {
+
+                        expiryTimes.remove(key);
+                    }
+
+                } else if (command.equalsIgnoreCase("INCR")
+                        && arguments.length == 2) {
+
+                    String key = arguments[1];
+
+                    if (!store.containsKey(key)) {
+
+                        store.put(key, "1");
+
+                    } else {
+
+                        try {
+
+                            long number =
+                                    Long.parseLong(store.get(key));
+
+                            number++;
+
+                            store.put(
+                                    key,
+                                    String.valueOf(number)
+                            );
+
+                        } catch (NumberFormatException ignored) {
+                        }
+                    }
+                }
+                replicaOffset += commandBytes;
+            }
+        } catch (IOException e) {
+
+            System.out.println(
+                    "Replication handshake failed: "
+                            + e.getMessage()
+            );
+        }
+    }
 
     private static void handleClient(Socket client) {
         try {
             InputStream input = client.getInputStream();
             boolean inTransaction = false;
+            boolean replicationConnection = false;
 
             List<TransactionCommand> transactionQueue =
                     new ArrayList<>();
+
+            Map<String, Long> watchedKeys = new HashMap<>();
 
             while (true) {
 
@@ -256,7 +611,8 @@ public class Main {
                 if (inTransaction &&
                         !command.equalsIgnoreCase("MULTI") &&
                         !command.equalsIgnoreCase("EXEC") &&
-                        !command.equalsIgnoreCase("DISCARD")) {
+                        !command.equalsIgnoreCase("DISCARD")&&
+                        !command.equalsIgnoreCase("WATCH")) {
 
                     transactionQueue.add(
                             new TransactionCommand(arguments.clone())
@@ -264,7 +620,37 @@ public class Main {
 
                     write(client, "+QUEUED\r\n");
                     continue;
-                }if (command.equalsIgnoreCase("MULTI")) {
+                }if (command.equalsIgnoreCase("WATCH")) {
+
+                    if (inTransaction) {
+                        write(client,
+                                "-ERR WATCH inside MULTI is not allowed\r\n");
+                        continue;
+                    }
+
+                    if (arguments.length < 2) {
+                        write(client,
+                                "-ERR wrong number of arguments\r\n");
+                        continue;
+                    }
+
+                    for (int i = 1; i < arguments.length; i++) {
+                        String key = arguments[i];
+
+                        watchedKeys.put(
+                                key,
+                                getKeyVersion(key)
+                        );
+                    }
+
+                    write(client, "+OK\r\n");
+                }else if (command.equalsIgnoreCase("UNWATCH")) {
+
+                    watchedKeys.clear();
+                    write(client, "+OK\r\n");
+                }
+
+                else if (command.equalsIgnoreCase("MULTI")) {
 
                     if (inTransaction) {
                         write(client, "-ERR MULTI calls can not be nested\r\n");
@@ -279,6 +665,30 @@ public class Main {
 
                     if (!inTransaction) {
                         write(client, "-ERR EXEC without MULTI\r\n");
+                        continue;
+                    }
+                    boolean watchFailed = false;
+
+                    for (Map.Entry<String, Long> watched : watchedKeys.entrySet()) {
+
+                        String key = watched.getKey();
+
+                        long oldVersion = watched.getValue();
+
+                        long currentVersion = getKeyVersion(key);
+
+                        if (oldVersion != currentVersion) {
+                            watchFailed = true;
+                            break;
+                        }
+                    }
+
+                    if (watchFailed) {
+                        transactionQueue.clear();
+                        watchedKeys.clear();
+                        inTransaction = false;
+
+                        write(client, "*-1\r\n");
                         continue;
                     }
 
@@ -315,6 +725,10 @@ public class Main {
                             String value = queuedArguments[2];
 
                             store.put(key, value);
+                            markKeyModified(key);
+                            if (!isReplica) {
+                                propagateCommand(queuedArguments);
+                            }
 
                             if (queuedArguments.length >= 5 &&
                                     queuedArguments[3].equalsIgnoreCase("PX")) {
@@ -353,6 +767,12 @@ public class Main {
                             if (!store.containsKey(key)) {
 
                                 store.put(key, "1");
+                                markKeyModified(key);
+
+                                if (!isReplica) {
+                                    propagateCommand(queuedArguments);
+                                }
+
                                 response.append(":1\r\n");
 
                             } else {
@@ -370,6 +790,12 @@ public class Main {
                                             key,
                                             String.valueOf(number)
                                     );
+
+                                    markKeyModified(key);
+
+                                    if (!isReplica) {
+                                        propagateCommand(queuedArguments);
+                                    }
 
                                     response.append(":")
                                             .append(number)
@@ -432,8 +858,8 @@ public class Main {
                             );
                         }
                     }
-
                     transactionQueue.clear();
+                    watchedKeys.clear();
 
                     write(client, response.toString());
                 }else if (command.equalsIgnoreCase("DISCARD")) {
@@ -449,6 +875,7 @@ public class Main {
                     }
 
                     transactionQueue.clear();
+                    watchedKeys.clear();
                     inTransaction = false;
 
                     write(client, "+OK\r\n");
@@ -461,6 +888,154 @@ public class Main {
                 else if (command.equalsIgnoreCase("PING")) {
 
                     write(client, "+PONG\r\n");
+                }
+
+                else if (command.equalsIgnoreCase("REPLCONF")) {
+
+                    if (replicationConnection
+                            && arguments.length >= 3
+                            && arguments[1].equalsIgnoreCase("ACK")) {
+
+                        long ackOffset =
+                                Long.parseLong(arguments[2]);
+
+                        replicaAckOffsets.put(client, ackOffset);
+
+                        synchronized (replicationLock) {
+                            replicationLock.notifyAll();
+                        }
+
+                    } else {
+                        write(client, "+OK\r\n");
+                    }
+                }
+                else if (command.equalsIgnoreCase("PSYNC")) {
+
+                    String response =
+                            "+FULLRESYNC " +
+                                    masterReplId +
+                                    " " +
+                                    masterReplOffset +
+                                    "\r\n";
+
+                    write(client, response);
+
+                    // Add this connection as a replica
+                    replicas.add(client);
+                    replicaAckOffsets.put(client, 0L);
+                    replicationConnection = true;
+
+                    // Send empty RDB
+                    String rdbHeader =
+                            "$" + EMPTY_RDB.length + "\r\n";
+
+                    write(client, rdbHeader);
+
+                    writeBytes(client, EMPTY_RDB);
+
+                }
+                else if (command.equalsIgnoreCase("WAIT")) {
+
+                    if (arguments.length != 3) {
+                        write(client, "-ERR wrong number of arguments\r\n");
+                        continue;
+                    }
+
+                    int requiredReplicas =
+                            Integer.parseInt(arguments[1]);
+
+                    long timeoutMillis =
+                            Long.parseLong(arguments[2]);
+
+                    long targetOffset;
+
+                    synchronized (replicationLock) {
+                        targetOffset = masterReplOffset;
+
+                        // No writes have been sent yet.
+                        // All connected replicas are at offset 0.
+                        if (targetOffset == 0) {
+                            write(
+                                    client,
+                                    ":" + replicas.size() + "\r\n"
+                            );
+                            continue;
+                        }
+
+                        String getAck =
+                                "*3\r\n" +
+                                        "$8\r\n" +
+                                        "REPLCONF\r\n" +
+                                        "$6\r\n" +
+                                        "GETACK\r\n" +
+                                        "$1\r\n" +
+                                        "*\r\n";
+
+                        for (Socket replica : replicas) {
+                            try {
+                                writeBytes(
+                                        replica,
+                                        getAck.getBytes(StandardCharsets.UTF_8)
+                                );
+                            } catch (IOException e) {
+                                replicas.remove(replica);
+                                replicaAckOffsets.remove(replica);
+                            }
+                        }
+                    }
+
+                    long deadline =
+                            System.currentTimeMillis() + timeoutMillis;
+
+                    while (true) {
+
+                        int acknowledged = 0;
+
+                        for (Socket replica : replicas) {
+                            long ack =
+                                    replicaAckOffsets.getOrDefault(
+                                            replica,
+                                            0L
+                                    );
+
+                            if (ack >= targetOffset) {
+                                acknowledged++;
+                            }
+                        }
+
+                        if (acknowledged >= requiredReplicas) {
+                            write(
+                                    client,
+                                    ":" + acknowledged + "\r\n"
+                            );
+                            break;
+                        }
+
+                        long remaining =
+                                deadline - System.currentTimeMillis();
+
+                        if (remaining <= 0) {
+                            write(
+                                    client,
+                                    ":" + acknowledged + "\r\n"
+                            );
+                            break;
+                        }
+
+                        synchronized (replicationLock) {
+                            try {
+                                replicationLock.wait(remaining);
+                            } catch (InterruptedException e) {
+                                Thread.currentThread().interrupt();
+
+                                write(
+                                        client,
+                                        ":" + acknowledged + "\r\n"
+                                );
+                                break;
+                            }
+                        }
+                    }
                 }
 
                 // -------------------------
@@ -492,6 +1067,10 @@ public class Main {
                     String value = arguments[2];
 
                     store.put(key, value);
+                    markKeyModified(key);
+                    if (!isReplica) {
+                        propagateCommand(arguments);
+                    }
 
                     if (arguments.length >= 5
                             && arguments[3].equalsIgnoreCase("PX")) {
@@ -550,9 +1129,15 @@ public class Main {
 
                     String key = arguments[1];
 
-                    // Key doesn't exist
                     if (!store.containsKey(key)) {
+
                         store.put(key, "1");
+                        markKeyModified(key);
+
+                        if (!isReplica) {
+                            propagateCommand(arguments);
+                        }
+
                         write(client, ":1\r\n");
                         continue;
                     }
@@ -560,11 +1145,17 @@ public class Main {
                     String value = store.get(key);
 
                     try {
+
                         long number = Long.parseLong(value);
 
                         number++;
 
                         store.put(key, String.valueOf(number));
+                        markKeyModified(key);
+
+                        if (!isReplica) {
+                            propagateCommand(arguments);
+                        }
 
                         write(client, ":" + number + "\r\n");
 
@@ -1446,6 +2037,7 @@ public class Main {
                     }
 
                     // Successfully obtained an element.
+
                     String response =
                             "*2\r\n"
                                     + encodeBulkString(key)
@@ -1456,7 +2048,33 @@ public class Main {
                             response
                     );
                 }
+                else if (command.equalsIgnoreCase("INFO")) {
 
+                    if (arguments.length >= 2 &&
+                            arguments[1].equalsIgnoreCase("replication")) {
+
+                        String role = isReplica ? "slave" : "master";
+
+                        String response =
+                                "role:" + role + "\r\n" +
+                                        "master_replid:" + masterReplId + "\r\n" +
+                                        "master_repl_offset:" + masterReplOffset + "\r\n";
+
+                        write(client, encodeBulkString(response));
+
+                    } else if (arguments.length >= 2 &&
+                            arguments[1].equalsIgnoreCase("server")) {
+
+                        String response = "redis_version:7.2.0\r\n";
+
+                        write(client, encodeBulkString(response));
+
+                    } else {
+
+                        String response = "redis_version:7.2.0\r\n";
+                        write(client, encodeBulkString(response));
+                    }
+                }
                 // -------------------------
                 // UNKNOWN COMMAND
                 // -------------------------
@@ -1475,7 +2093,10 @@ public class Main {
                     "Client error: " + e.getMessage()
             );
 
-        } finally {
+        }finally {
+
+            replicas.remove(client);
+            replicaAckOffsets.remove(client);
 
             try {
                 client.close();
@@ -1595,5 +2216,64 @@ public class Main {
                         StandardCharsets.UTF_8
                 )
         );
+    }
+    private static byte[] encodeCommand(String[] arguments) {
+
+        StringBuilder response =
+                new StringBuilder();
+
+        response.append("*")
+                .append(arguments.length)
+                .append("\r\n");
+
+        for (String argument : arguments) {
+
+            byte[] bytes =
+                    argument.getBytes(StandardCharsets.UTF_8);
+
+            response.append("$")
+                    .append(bytes.length)
+                    .append("\r\n")
+                    .append(argument)
+                    .append("\r\n");
+        }
+
+        return response.toString()
+                .getBytes(StandardCharsets.UTF_8);
+    }
+    private static void propagateCommand(
+            String[] arguments) {
+
+        byte[] command =
+                encodeCommand(arguments);
+
+        synchronized (replicationLock) {
+
+            masterReplOffset += command.length;
+
+            for (Socket replica : replicas) {
+
+                try {
+
+                    writeBytes(replica, command);
+
+                } catch (IOException e) {
+
+                    replicas.remove(replica);
+                    replicaAckOffsets.remove(replica);
+
+                    try {
+                        replica.close();
+                    } catch (IOException ignored) {
+                    }
+                }
+            }
+        }
+    }
+    private static void writeBytes(
+            Socket client,
+            byte[] data) throws IOException {
+
+        client.getOutputStream().write(data);
     }
 }
