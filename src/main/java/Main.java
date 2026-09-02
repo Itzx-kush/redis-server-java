@@ -51,6 +51,14 @@ public class Main {
             this.fields = fields;
         }
     }
+    private static class TransactionCommand {
+        String[] arguments;
+
+        TransactionCommand(String[] arguments) {
+            this.arguments = arguments;
+        }
+    }
+
     private static class StreamId {
         long time;
         long sequence;
@@ -212,6 +220,10 @@ public class Main {
     private static void handleClient(Socket client) {
         try {
             InputStream input = client.getInputStream();
+            boolean inTransaction = false;
+
+            List<TransactionCommand> transactionQueue =
+                    new ArrayList<>();
 
             while (true) {
 
@@ -241,11 +253,212 @@ public class Main {
                 }
 
                 String command = arguments[0];
+                if (inTransaction &&
+                        !command.equalsIgnoreCase("MULTI") &&
+                        !command.equalsIgnoreCase("EXEC") &&
+                        !command.equalsIgnoreCase("DISCARD")) {
+
+                    transactionQueue.add(
+                            new TransactionCommand(arguments.clone())
+                    );
+
+                    write(client, "+QUEUED\r\n");
+                    continue;
+                }if (command.equalsIgnoreCase("MULTI")) {
+
+                    if (inTransaction) {
+                        write(client, "-ERR MULTI calls can not be nested\r\n");
+                        continue;
+                    }
+
+                    inTransaction = true;
+                    transactionQueue.clear();
+
+                    write(client, "+OK\r\n");
+                }else if (command.equalsIgnoreCase("EXEC")) {
+
+                    if (!inTransaction) {
+                        write(client, "-ERR EXEC without MULTI\r\n");
+                        continue;
+                    }
+
+                    inTransaction = false;
+
+                    StringBuilder response = new StringBuilder();
+
+                    response.append("*")
+                            .append(transactionQueue.size())
+                            .append("\r\n");
+
+                    for (TransactionCommand transactionCommand :
+                            transactionQueue) {
+
+                        String[] queuedArguments =
+                                transactionCommand.arguments;
+
+                        String queuedCommand =
+                                queuedArguments[0];
+
+                        // -------------------------
+                        // SET
+                        // -------------------------
+                        if (queuedCommand.equalsIgnoreCase("SET")) {
+
+                            if (queuedArguments.length < 3) {
+                                response.append(
+                                        "-ERR wrong number of arguments\r\n"
+                                );
+                                continue;
+                            }
+
+                            String key = queuedArguments[1];
+                            String value = queuedArguments[2];
+
+                            store.put(key, value);
+
+                            if (queuedArguments.length >= 5 &&
+                                    queuedArguments[3].equalsIgnoreCase("PX")) {
+
+                                long milliseconds =
+                                        Long.parseLong(queuedArguments[4]);
+
+                                expiryTimes.put(
+                                        key,
+                                        System.currentTimeMillis()
+                                                + milliseconds
+                                );
+
+                            } else {
+
+                                expiryTimes.remove(key);
+                            }
+
+                            response.append("+OK\r\n");
+                        }
+
+                        // -------------------------
+                        // INCR
+                        // -------------------------
+                        else if (queuedCommand.equalsIgnoreCase("INCR")) {
+
+                            if (queuedArguments.length != 2) {
+                                response.append(
+                                        "-ERR wrong number of arguments\r\n"
+                                );
+                                continue;
+                            }
+
+                            String key = queuedArguments[1];
+
+                            if (!store.containsKey(key)) {
+
+                                store.put(key, "1");
+                                response.append(":1\r\n");
+
+                            } else {
+
+                                String value = store.get(key);
+
+                                try {
+
+                                    long number =
+                                            Long.parseLong(value);
+
+                                    number++;
+
+                                    store.put(
+                                            key,
+                                            String.valueOf(number)
+                                    );
+
+                                    response.append(":")
+                                            .append(number)
+                                            .append("\r\n");
+
+                                } catch (NumberFormatException e) {
+
+                                    response.append(
+                                            "-ERR value is not an integer or out of range\r\n"
+                                    );
+                                }
+                            }
+                        }
+
+                        // -------------------------
+                        // GET
+                        // -------------------------
+                        else if (queuedCommand.equalsIgnoreCase("GET")) {
+
+                            if (queuedArguments.length != 2) {
+                                response.append(
+                                        "-ERR wrong number of arguments\r\n"
+                                );
+                                continue;
+                            }
+
+                            String key = queuedArguments[1];
+
+                            Long expiryTime =
+                                    expiryTimes.get(key);
+
+                            if (expiryTime != null &&
+                                    System.currentTimeMillis() >= expiryTime) {
+
+                                store.remove(key);
+                                expiryTimes.remove(key);
+                            }
+
+                            String value = store.get(key);
+
+                            if (value == null) {
+
+                                response.append("$-1\r\n");
+
+                            } else {
+
+                                response.append(
+                                        encodeBulkString(value)
+                                );
+                            }
+                        }
+
+                        // -------------------------
+                        // Unknown command
+                        // -------------------------
+                        else {
+
+                            response.append(
+                                    "-ERR unknown command\r\n"
+                            );
+                        }
+                    }
+
+                    transactionQueue.clear();
+
+                    write(client, response.toString());
+                }else if (command.equalsIgnoreCase("DISCARD")) {
+
+                    if (!inTransaction) {
+
+                        write(
+                                client,
+                                "-ERR DISCARD without MULTI\r\n"
+                        );
+
+                        continue;
+                    }
+
+                    transactionQueue.clear();
+                    inTransaction = false;
+
+                    write(client, "+OK\r\n");
+                }
+
 
                 // -------------------------
                 // PING
                 // -------------------------
-                if (command.equalsIgnoreCase("PING")) {
+                else if (command.equalsIgnoreCase("PING")) {
 
                     write(client, "+PONG\r\n");
                 }
@@ -328,7 +541,41 @@ public class Main {
                     } else {
                         write(client, encodeBulkString(value));
                     }
-                }else if (command.equalsIgnoreCase("TYPE")) {
+                } else if (command.equalsIgnoreCase("INCR")) {
+
+                    if (arguments.length != 2) {
+                        write(client, "-ERR wrong number of arguments\r\n");
+                        continue;
+                    }
+
+                    String key = arguments[1];
+
+                    // Key doesn't exist
+                    if (!store.containsKey(key)) {
+                        store.put(key, "1");
+                        write(client, ":1\r\n");
+                        continue;
+                    }
+
+                    String value = store.get(key);
+
+                    try {
+                        long number = Long.parseLong(value);
+
+                        number++;
+
+                        store.put(key, String.valueOf(number));
+
+                        write(client, ":" + number + "\r\n");
+
+                    } catch (NumberFormatException e) {
+
+                        write(client,
+                                "-ERR value is not an integer or out of range\r\n");
+                    }
+                }
+
+                else if (command.equalsIgnoreCase("TYPE")) {
 
                     String key = arguments[1];
 
