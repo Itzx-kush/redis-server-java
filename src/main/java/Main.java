@@ -2320,6 +2320,72 @@ public class Main {
 
                     write(client, encodeBulkString(value));
                 }
+                // -------------------------
+// SETBIT
+// -------------------------
+                else if (command.equalsIgnoreCase("SETBIT")) {
+
+                    if (arguments.length != 4) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+
+                    long offset;
+                    int bit;
+
+                    try {
+                        offset = Long.parseLong(arguments[2]);
+                        bit = Integer.parseInt(arguments[3]);
+                    } catch (NumberFormatException e) {
+                        write(
+                                client,
+                                "-ERR invalid integer\r\n"
+                        );
+                        continue;
+                    }
+
+                    if (offset < 0) {
+                        write(
+                                client,
+                                "-ERR bit offset is not an integer or out of range\r\n"
+                        );
+                        continue;
+                    }
+
+                    if (bit != 0 && bit != 1) {
+                        write(
+                                client,
+                                "-ERR bit is not an integer or out of range\r\n"
+                        );
+                        continue;
+                    }
+
+                    int oldBit =
+                            Bitmaps.setBit(
+                                    store,
+                                    key,
+                                    offset,
+                                    bit
+                            );
+
+                    markKeyModified(key);
+
+                    if (!isReplica) {
+                        propagateCommand(arguments);
+                    }
+
+                    appendAofCommand(arguments);
+
+                    write(
+                            client,
+                            ":" + oldBit + "\r\n"
+                    );
+                }
 
                 // -------------------------
                 // SET
@@ -2395,6 +2461,185 @@ public class Main {
                     }
 
                     write(client, response.toString());
+                }
+                // -------------------------
+// GETBIT
+// -------------------------
+                else if (command.equalsIgnoreCase("GETBIT")) {
+
+                    if (arguments.length != 3) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+
+                    long offset;
+
+                    try {
+                        offset = Long.parseLong(arguments[2]);
+                    } catch (NumberFormatException e) {
+                        write(
+                                client,
+                                "-ERR invalid integer\r\n"
+                        );
+                        continue;
+                    }
+
+                    if (offset < 0) {
+                        write(
+                                client,
+                                "-ERR bit offset is not an integer or out of range\r\n"
+                        );
+                        continue;
+                    }
+
+                    int bit =
+                            Bitmaps.getBit(
+                                    store,
+                                    key,
+                                    offset
+                            );
+
+                    write(
+                            client,
+                            ":" + bit + "\r\n"
+                    );
+                }
+                // -------------------------
+// BITOP
+// -------------------------
+                else if (command.equalsIgnoreCase("BITOP")) {
+
+                    if (arguments.length != 5) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String operation = arguments[1];
+                    String destination = arguments[2];
+                    String key1 = arguments[3];
+                    String key2 = arguments[4];
+
+                    int length;
+
+                    if (operation.equalsIgnoreCase("AND")) {
+
+                        length =
+                                Bitmaps.bitOpAnd(
+                                        store,
+                                        destination,
+                                        key1,
+                                        key2
+                                );
+
+                    } else if (operation.equalsIgnoreCase("OR")) {
+
+                        length =
+                                Bitmaps.bitOpOr(
+                                        store,
+                                        destination,
+                                        key1,
+                                        key2
+                                );
+
+                    } else {
+
+                        write(
+                                client,
+                                "-ERR unsupported BITOP operation\r\n"
+                        );
+                        continue;
+                    }
+
+                    markKeyModified(destination);
+
+                    if (!isReplica) {
+                        propagateCommand(arguments);
+                    }
+
+                    appendAofCommand(arguments);
+
+                    write(
+                            client,
+                            ":" + length + "\r\n"
+                    );
+                }
+                // -------------------------
+// BITCOUNT
+// -------------------------
+                else if (command.equalsIgnoreCase("BITCOUNT")) {
+
+                    if (arguments.length != 2 &&
+                            arguments.length != 4) {
+
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+
+                    Integer start = null;
+                    Integer end = null;
+
+                    if (arguments.length == 4) {
+                        try {
+                            start = Integer.parseInt(arguments[2]);
+                            end = Integer.parseInt(arguments[3]);
+                        } catch (NumberFormatException e) {
+                            write(
+                                    client,
+                                    "-ERR invalid integer\r\n"
+                            );
+                            continue;
+                        }
+                    }
+
+                    int count =
+                            Bitmaps.bitCount(
+                                    store,
+                                    key,
+                                    start,
+                                    end
+                            );
+
+                    write(
+                            client,
+                            ":" + count + "\r\n"
+                    );
+                }
+                // -------------------------
+// STRLEN
+// -------------------------
+                else if (command.equalsIgnoreCase("STRLEN")) {
+
+                    if (arguments.length != 2) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    int length =
+                            Bitmaps.stringLength(
+                                    store,
+                                    arguments[1]
+                            );
+
+                    write(
+                            client,
+                            ":" + length + "\r\n"
+                    );
                 }
 
                 // -------------------------
