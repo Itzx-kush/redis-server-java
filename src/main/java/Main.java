@@ -1,5 +1,8 @@
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
@@ -14,6 +17,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.TimeUnit;
 import java.util.HashMap;
+import java.util.Set;
 
 public class Main {
 
@@ -28,6 +32,14 @@ public class Main {
 
     private static int serverPort = 6379;
     private static long replicaOffset = 0;
+
+    private static String rdbDir = ".";
+    private static String rdbFilename = "dump.rdb";
+
+    private static String appendOnly = "no";
+    private static String appendDirName = "appendonlydir";
+    private static String appendFileName = "appendonly.aof";
+    private static String appendFsync = "everysec";
 
     private static String masterHost;
     private static int masterPort;
@@ -66,10 +78,25 @@ public class Main {
     private static final Map<String, Long> expiryTimes =
             new ConcurrentHashMap<>();
 
+    private static final Map<String, Set<Socket>> subscribers =
+            new ConcurrentHashMap<>();
+
+    private static final Map<Socket, Set<String>> clientSubscriptions =
+            new ConcurrentHashMap<>();
+
+    private static final Map<String, Set<Socket>> patternSubscribers =
+            new ConcurrentHashMap<>();
+
+    private static final Map<Socket, Set<String>> clientPatternSubscriptions =
+            new ConcurrentHashMap<>();
+
     private static final Map<String, Long> keyVersions =
             new ConcurrentHashMap<>();
 
     private static final Map<String, List<String>> lists =
+            new ConcurrentHashMap<>();
+
+    private static final Map<String, Map<String, Double>> sortedSets =
             new ConcurrentHashMap<>();
 
     private static final Object xreadLock = new Object();
@@ -255,6 +282,7 @@ public class Main {
 
             if (args[i].equals("--port") && i + 1 < args.length) {
                 serverPort = Integer.parseInt(args[i + 1]);
+                i++;
             }
 
             if (args[i].equals("--replicaof") && i + 1 < args.length) {
@@ -267,11 +295,43 @@ public class Main {
 
                 i++;
             }
+            if (args[i].equals("--dir") && i + 1 < args.length) {
+                rdbDir = args[i + 1];
+                i++;
+            }
+
+            if (args[i].equals("--dbfilename") && i + 1 < args.length) {
+                rdbFilename = args[i + 1];
+                i++;
+            }
+            if (args[i].equals("--appendonly") && i + 1 < args.length) {
+                appendOnly = args[i + 1];
+                i++;
+            }
+
+            if (args[i].equals("--appenddirname") && i + 1 < args.length) {
+                appendDirName = args[i + 1];
+                i++;
+            }
+
+            if (args[i].equals("--appendfilename") && i + 1 < args.length) {
+                appendFileName = args[i + 1];
+                i++;
+            }
+
+            if (args[i].equals("--appendfsync") && i + 1 < args.length) {
+                appendFsync = args[i + 1];
+                i++;
+            }
         }
 
         try {
             ServerSocket serverSocket = new ServerSocket(serverPort);
             serverSocket.setReuseAddress(true);
+
+            loadRdbFile();
+            replayAofFile();
+            setupAofFiles();
 
             if (isReplica) {
                 Thread handshakeThread =
@@ -568,6 +628,643 @@ public class Main {
             );
         }
     }
+    private static void loadRdbFile() {
+
+        Path rdbPath =
+                Paths.get(rdbDir, rdbFilename);
+
+        if (!Files.exists(rdbPath)) {
+            return;
+        }
+
+        try {
+
+            byte[] data =
+                    Files.readAllBytes(rdbPath);
+
+            if (data.length < 9) {
+                return;
+            }
+
+            RdbReader reader =
+                    new RdbReader(data);
+
+            String header =
+                    new String(
+                            reader.readBytes(9),
+                            StandardCharsets.US_ASCII
+                    );
+
+            if (!header.startsWith("REDIS")) {
+                return;
+            }
+
+            int currentDb = 0;
+
+            while (reader.hasRemaining()) {
+
+                int type =
+                        reader.readUnsignedByte();
+
+                // AUX
+                if (type == 0xFA) {
+                    reader.readString();
+                    reader.readString();
+                    continue;
+                }
+
+                // RESIZEDB
+                if (type == 0xFB) {
+                    reader.readLength();
+                    reader.readLength();
+                    continue;
+                }
+
+                // Expiry in milliseconds
+                if (type == 0xFC) {
+
+                    long expiryTime =
+                            reader.readLittleEndianLong();
+
+                    int valueType =
+                            reader.readUnsignedByte();
+
+                    if (valueType != 0) {
+                        break;
+                    }
+
+                    String key =
+                            reader.readString();
+
+                    String value =
+                            reader.readString();
+
+                    if (currentDb == 0 &&
+                            System.currentTimeMillis() < expiryTime) {
+
+                        store.put(key, value);
+                        expiryTimes.put(key, expiryTime);
+                    }
+
+                    continue;
+                }
+
+                // Expiry in seconds
+                if (type == 0xFD) {
+
+                    long expirySeconds =
+                            reader.readLittleEndianUnsignedInt();
+
+                    long expiryTime =
+                            expirySeconds * 1000L;
+
+                    int valueType =
+                            reader.readUnsignedByte();
+
+                    if (valueType != 0) {
+                        break;
+                    }
+
+                    String key =
+                            reader.readString();
+
+                    String value =
+                            reader.readString();
+
+                    if (currentDb == 0 &&
+                            System.currentTimeMillis() < expiryTime) {
+
+                        store.put(key, value);
+                        expiryTimes.put(key, expiryTime);
+                    }
+
+                    continue;
+                }
+
+                // SELECTDB
+                if (type == 0xFE) {
+
+                    currentDb =
+                            (int) reader.readLength();
+
+                    continue;
+                }
+
+                // EOF
+                if (type == 0xFF) {
+                    break;
+                }
+
+                // String value
+                if (type == 0x00) {
+
+                    String key =
+                            reader.readString();
+
+                    String value =
+                            reader.readString();
+
+                    if (currentDb == 0) {
+                        store.put(key, value);
+                        expiryTimes.remove(key);
+                    }
+
+                    continue;
+                }
+
+                // Unsupported type
+                break;
+            }
+
+        } catch (IOException | RuntimeException e) {
+
+            System.out.println(
+                    "Could not load RDB file: "
+                            + e.getMessage()
+            );
+        }
+    }
+    private static void replayAofFile() {
+
+        if (!appendOnly.equalsIgnoreCase("yes")) {
+            return;
+        }
+
+        try {
+
+            Path aofDir =
+                    Paths.get(rdbDir, appendDirName);
+
+            Path manifestFile =
+                    aofDir.resolve(
+                            appendFileName + ".manifest"
+                    );
+
+            if (!Files.exists(manifestFile)) {
+                return;
+            }
+
+            String manifest =
+                    Files.readString(
+                            manifestFile,
+                            StandardCharsets.UTF_8
+                    );
+
+            String activeFile = null;
+
+            for (String line : manifest.split("\\R")) {
+
+                if (line.startsWith("file ") &&
+                        line.contains(" type i")) {
+
+                    String[] parts =
+                            line.split(" ");
+
+                    if (parts.length >= 5) {
+                        activeFile = parts[1];
+                        break;
+                    }
+                }
+            }
+
+            if (activeFile == null) {
+                return;
+            }
+
+            Path aofFile =
+                    aofDir.resolve(activeFile);
+
+            if (!Files.exists(aofFile)) {
+                return;
+            }
+
+            byte[] data =
+                    Files.readAllBytes(aofFile);
+
+            java.io.ByteArrayInputStream input =
+                    new java.io.ByteArrayInputStream(data);
+
+            while (input.available() > 0) {
+
+                String arrayHeader =
+                        readLine(input);
+
+                if (arrayHeader == null) {
+                    break;
+                }
+
+                if (!arrayHeader.startsWith("*")) {
+                    break;
+                }
+
+                int argumentCount =
+                        Integer.parseInt(
+                                arrayHeader.substring(1)
+                        );
+
+                String[] arguments =
+                        new String[argumentCount];
+
+                for (int i = 0; i < argumentCount; i++) {
+                    arguments[i] =
+                            readBulkString(input);
+                }
+
+                if (arguments.length == 0) {
+                    continue;
+                }
+
+                String command =
+                        arguments[0];
+
+                if (command.equalsIgnoreCase("SET")
+                        && arguments.length >= 3) {
+
+                    String key = arguments[1];
+                    String value = arguments[2];
+
+                    store.put(key, value);
+
+                    if (arguments.length >= 5 &&
+                            arguments[3].equalsIgnoreCase("PX")) {
+
+                        long milliseconds =
+                                Long.parseLong(arguments[4]);
+
+                        expiryTimes.put(
+                                key,
+                                System.currentTimeMillis()
+                                        + milliseconds
+                        );
+
+                    } else {
+
+                        expiryTimes.remove(key);
+                    }
+                }
+            }
+
+        } catch (Exception e) {
+
+            System.out.println(
+                    "Could not replay AOF: "
+                            + e.getMessage()
+            );
+        }
+    }
+    private static void setupAofFiles() {
+
+        if (!appendOnly.equalsIgnoreCase("yes")) {
+            return;
+        }
+
+        try {
+
+            Path aofDir =
+                    Paths.get(rdbDir, appendDirName);
+
+            Files.createDirectories(aofDir);
+
+            Path manifestFile =
+                    aofDir.resolve(
+                            appendFileName + ".manifest"
+                    );
+
+            // If the manifest already exists,
+            // keep the tester's active AOF filename.
+            if (Files.exists(manifestFile)) {
+                return;
+            }
+
+            Path aofFile =
+                    aofDir.resolve(
+                            appendFileName + ".1.incr.aof"
+                    );
+
+            if (!Files.exists(aofFile)) {
+                Files.createFile(aofFile);
+            }
+
+            String manifestContent =
+                    "file " +
+                            appendFileName +
+                            ".1.incr.aof seq 1 type i\n";
+
+            Files.writeString(
+                    manifestFile,
+                    manifestContent,
+                    StandardCharsets.UTF_8
+            );
+
+        } catch (IOException e) {
+
+            System.out.println(
+                    "Could not setup AOF files: "
+                            + e.getMessage()
+            );
+        }
+    }
+    private static void appendAofCommand(
+            String[] arguments) {
+
+        if (!appendOnly.equalsIgnoreCase("yes")) {
+            return;
+        }
+
+        try {
+
+            Path aofDir =
+                    Paths.get(rdbDir, appendDirName);
+
+            Path manifestFile =
+                    aofDir.resolve(
+                            appendFileName + ".manifest"
+                    );
+
+            String manifest =
+                    Files.readString(
+                            manifestFile,
+                            StandardCharsets.UTF_8
+                    );
+
+            String activeFile = null;
+
+            for (String line : manifest.split("\\R")) {
+
+                if (line.startsWith("file ") &&
+                        line.contains(" type i")) {
+
+                    String[] parts =
+                            line.split(" ");
+
+                    if (parts.length >= 5) {
+                        activeFile = parts[1];
+                        break;
+                    }
+                }
+            }
+
+            if (activeFile == null) {
+                return;
+            }
+
+            Path aofFile =
+                    aofDir.resolve(activeFile);
+
+            byte[] command =
+                    encodeCommand(arguments);
+
+            try (java.io.FileOutputStream output =
+                         new java.io.FileOutputStream(
+                                 aofFile.toFile(),
+                                 true)) {
+
+                output.write(command);
+
+                if (appendFsync.equalsIgnoreCase("always")) {
+                    output.getFD().sync();
+                }
+            }
+
+        } catch (IOException e) {
+
+            System.out.println(
+                    "Could not write AOF: "
+                            + e.getMessage()
+            );
+        }
+    }
+
+    private static class RdbReader {
+
+        private final byte[] data;
+        private int position = 0;
+
+        RdbReader(byte[] data) {
+            this.data = data;
+        }
+
+        boolean hasRemaining() {
+            return position < data.length;
+        }
+
+        int readUnsignedByte() {
+
+            if (position >= data.length) {
+                throw new RuntimeException(
+                        "Unexpected end of RDB"
+                );
+            }
+
+            return data[position++] & 0xFF;
+        }
+
+        byte[] readBytes(int length) {
+
+            if (position + length > data.length) {
+                throw new RuntimeException(
+                        "Unexpected end of RDB"
+                );
+            }
+
+            byte[] result =
+                    java.util.Arrays.copyOfRange(
+                            data,
+                            position,
+                            position + length
+                    );
+
+            position += length;
+
+            return result;
+        }
+
+        long readLength() {
+
+            int first =
+                    readUnsignedByte();
+
+            int type =
+                    (first & 0xC0) >> 6;
+
+            if (type == 0) {
+                return first & 0x3F;
+            }
+
+            if (type == 1) {
+
+                int second =
+                        readUnsignedByte();
+
+                return ((long) (first & 0x3F) << 8)
+                        | second;
+            }
+
+            if (type == 2) {
+                return readBigEndianUnsignedInt();
+            }
+
+            throw new RuntimeException(
+                    "Special RDB length encoding"
+            );
+        }
+
+        long readBigEndianUnsignedInt() {
+
+            long value = 0;
+
+            for (int i = 0; i < 4; i++) {
+                value =
+                        (value << 8)
+                                | readUnsignedByte();
+            }
+
+            return value;
+        }
+
+        long readLittleEndianUnsignedInt() {
+
+            long value = 0;
+
+            for (int i = 0; i < 4; i++) {
+                value |=
+                        ((long) readUnsignedByte())
+                                << (8 * i);
+            }
+
+            return value;
+        }
+
+        long readLittleEndianLong() {
+
+            long value = 0;
+
+            for (int i = 0; i < 8; i++) {
+                value |=
+                        ((long) readUnsignedByte())
+                                << (8 * i);
+            }
+
+            return value;
+        }
+
+        String readString() {
+
+            int first = data[position] & 0xFF;
+
+            int encoding =
+                    (first & 0xC0) >> 6;
+
+            if (encoding == 3) {
+
+                int specialType =
+                        first & 0x3F;
+
+                readUnsignedByte();
+
+                if (specialType == 0) {
+                    int value =
+                            (byte) readUnsignedByte();
+
+                    return String.valueOf(value);
+                }
+
+                if (specialType == 1) {
+                    int low =
+                            readUnsignedByte();
+
+                    int high =
+                            readUnsignedByte();
+
+                    short value =
+                            (short) ((high << 8) | low);
+
+                    return String.valueOf(value);
+                }
+
+                if (specialType == 2) {
+                    int b0 = readUnsignedByte();
+                    int b1 = readUnsignedByte();
+                    int b2 = readUnsignedByte();
+                    int b3 = readUnsignedByte();
+
+                    int value =
+                            b0 |
+                                    (b1 << 8) |
+                                    (b2 << 16) |
+                                    (b3 << 24);
+
+                    return String.valueOf(value);
+                }
+
+                throw new RuntimeException(
+                        "Unsupported encoded string"
+                );
+            }
+
+            long length =
+                    readLength();
+
+            if (length > Integer.MAX_VALUE) {
+                throw new RuntimeException(
+                        "RDB string too large"
+                );
+            }
+
+            byte[] bytes =
+                    readBytes((int) length);
+
+            return new String(
+                    bytes,
+                    StandardCharsets.UTF_8
+            );
+        }
+    }
+
+    private static boolean globMatches(String pattern, String value) {
+
+        int p = 0;
+        int v = 0;
+        int star = -1;
+        int match = 0;
+
+        while (v < value.length()) {
+
+            if (p < pattern.length()
+                    && pattern.charAt(p) == value.charAt(v)) {
+                p++;
+                v++;
+            }
+
+            else if (p < pattern.length()
+                    && pattern.charAt(p) == '?') {
+                p++;
+                v++;
+            }
+
+            else if (p < pattern.length()
+                    && pattern.charAt(p) == '*') {
+                star = p++;
+                match = v;
+            }
+
+            else if (star != -1) {
+                p = star + 1;
+                v = ++match;
+            }
+
+            else {
+                return false;
+            }
+        }
+
+        while (p < pattern.length()
+                && pattern.charAt(p) == '*') {
+            p++;
+        }
+
+        return p == pattern.length();
+    }
 
     private static void handleClient(Socket client) {
         try {
@@ -611,7 +1308,7 @@ public class Main {
                 if (inTransaction &&
                         !command.equalsIgnoreCase("MULTI") &&
                         !command.equalsIgnoreCase("EXEC") &&
-                        !command.equalsIgnoreCase("DISCARD")&&
+                        !command.equalsIgnoreCase("DISCARD") &&
                         !command.equalsIgnoreCase("WATCH")) {
 
                     transactionQueue.add(
@@ -620,7 +1317,33 @@ public class Main {
 
                     write(client, "+QUEUED\r\n");
                     continue;
-                }if (command.equalsIgnoreCase("WATCH")) {
+                }
+                Set<String> subscribedChannels =
+                        clientSubscriptions.get(client);
+
+                boolean subscribedMode =
+                        subscribedChannels != null &&
+                                !subscribedChannels.isEmpty();
+
+                if (subscribedMode &&
+                        !command.equalsIgnoreCase("SUBSCRIBE") &&
+                        !command.equalsIgnoreCase("UNSUBSCRIBE") &&
+                        !command.equalsIgnoreCase("PSUBSCRIBE") &&
+                        !command.equalsIgnoreCase("PUNSUBSCRIBE") &&
+                        !command.equalsIgnoreCase("PING") &&
+                        !command.equalsIgnoreCase("QUIT")) {
+
+                    write(
+                            client,
+                            "-ERR Can't execute '" +
+                                    command.toLowerCase() +
+                                    "' in subscribed mode\r\n"
+                    );
+
+                    continue;
+                }
+
+                if (command.equalsIgnoreCase("WATCH")) {
 
                     if (inTransaction) {
                         write(client,
@@ -644,13 +1367,11 @@ public class Main {
                     }
 
                     write(client, "+OK\r\n");
-                }else if (command.equalsIgnoreCase("UNWATCH")) {
+                } else if (command.equalsIgnoreCase("UNWATCH")) {
 
                     watchedKeys.clear();
                     write(client, "+OK\r\n");
-                }
-
-                else if (command.equalsIgnoreCase("MULTI")) {
+                } else if (command.equalsIgnoreCase("MULTI")) {
 
                     if (inTransaction) {
                         write(client, "-ERR MULTI calls can not be nested\r\n");
@@ -661,7 +1382,7 @@ public class Main {
                     transactionQueue.clear();
 
                     write(client, "+OK\r\n");
-                }else if (command.equalsIgnoreCase("EXEC")) {
+                } else if (command.equalsIgnoreCase("EXEC")) {
 
                     if (!inTransaction) {
                         write(client, "-ERR EXEC without MULTI\r\n");
@@ -726,26 +1447,28 @@ public class Main {
 
                             store.put(key, value);
                             markKeyModified(key);
+
                             if (!isReplica) {
                                 propagateCommand(queuedArguments);
                             }
 
-                            if (queuedArguments.length >= 5 &&
-                                    queuedArguments[3].equalsIgnoreCase("PX")) {
+                            if (queuedArguments.length >= 5
+                                    && queuedArguments[3].equalsIgnoreCase("PX")) {
 
                                 long milliseconds =
                                         Long.parseLong(queuedArguments[4]);
 
-                                expiryTimes.put(
-                                        key,
+                                long expiryTime =
                                         System.currentTimeMillis()
-                                                + milliseconds
-                                );
+                                                + milliseconds;
+
+                                expiryTimes.put(key, expiryTime);
 
                             } else {
-
                                 expiryTimes.remove(key);
                             }
+
+                            appendAofCommand(queuedArguments);
 
                             response.append("+OK\r\n");
                         }
@@ -862,7 +1585,7 @@ public class Main {
                     watchedKeys.clear();
 
                     write(client, response.toString());
-                }else if (command.equalsIgnoreCase("DISCARD")) {
+                } else if (command.equalsIgnoreCase("DISCARD")) {
 
                     if (!inTransaction) {
 
@@ -880,14 +1603,359 @@ public class Main {
 
                     write(client, "+OK\r\n");
                 }
+                // -------------------------
+// SUBSCRIBE
+// -------------------------
+                else if (command.equalsIgnoreCase("SUBSCRIBE")) {
+
+                    if (arguments.length < 2) {
+                        write(client, "-ERR wrong number of arguments\r\n");
+                        continue;
+                    }
+
+                    String channel = arguments[1];
+
+                    clientSubscriptions.putIfAbsent(
+                            client,
+                            ConcurrentHashMap.newKeySet()
+                    );
+
+                    Set<String> channels =
+                            clientSubscriptions.get(client);
+
+                    channels.add(channel);
+
+                    subscribers
+                            .computeIfAbsent(
+                                    channel,
+                                    k -> ConcurrentHashMap.newKeySet()
+                            )
+                            .add(client);
+
+                    String response =
+                            "*3\r\n" +
+                                    encodeBulkString("subscribe") +
+                                    encodeBulkString(channel) +
+                                    ":" + channels.size() + "\r\n";
+
+                    write(client, response);
+
+                }else if (command.equalsIgnoreCase("PSUBSCRIBE")) {
+
+                    if (arguments.length < 2) {
+                        write(client, "-ERR wrong number of arguments\r\n");
+                        continue;
+                    }
+
+                    clientPatternSubscriptions.putIfAbsent(
+                            client,
+                            ConcurrentHashMap.newKeySet()
+                    );
+
+                    Set<String> patterns =
+                            clientPatternSubscriptions.get(client);
+
+                    for (int i = 1; i < arguments.length; i++) {
+
+                        String pattern = arguments[i];
+
+                        patterns.add(pattern);
+
+                        patternSubscribers
+                                .computeIfAbsent(
+                                        pattern,
+                                        k -> ConcurrentHashMap.newKeySet()
+                                )
+                                .add(client);
+
+                        String response =
+                                "*3\r\n" +
+                                        encodeBulkString("psubscribe") +
+                                        encodeBulkString(pattern) +
+                                        ":" + patterns.size() + "\r\n";
+
+                        write(client, response);
+                    }
+                }
 
 
-                // -------------------------
-                // PING
-                // -------------------------
+                else if (command.equalsIgnoreCase("UNSUBSCRIBE")) {
+
+                    Set<String> channels =
+                            clientSubscriptions.get(client);
+
+                    if (channels == null) {
+                        channels =
+                                ConcurrentHashMap.newKeySet();
+
+                        clientSubscriptions.put(
+                                client,
+                                channels
+                        );
+                    }
+
+                    // UNSUBSCRIBE with no arguments:
+                    // unsubscribe from all channels.
+                    if (arguments.length == 1) {
+
+                        for (String channel :
+                                new ArrayList<>(channels)) {
+
+                            channels.remove(channel);
+
+                            Set<Socket> channelSubscribers =
+                                    subscribers.get(channel);
+
+                            if (channelSubscribers != null) {
+
+                                channelSubscribers.remove(client);
+
+                                if (channelSubscribers.isEmpty()) {
+                                    subscribers.remove(channel);
+                                }
+                            }
+
+                            String response =
+                                    "*3\r\n" +
+                                            encodeBulkString("unsubscribe") +
+                                            encodeBulkString(channel) +
+                                            ":" + channels.size() + "\r\n";
+
+                            write(client, response);
+                        }
+
+                        // No subscriptions existed.
+                        if (channels.isEmpty()) {
+                            write(
+                                    client,
+                                    "*3\r\n" +
+                                            encodeBulkString("unsubscribe") +
+                                            "$-1\r\n" +
+                                            ":0\r\n"
+                            );
+                        }
+
+                        continue;
+                    }
+
+                    for (int i = 1; i < arguments.length; i++) {
+
+                        String channel = arguments[i];
+
+                        channels.remove(channel);
+
+                        Set<Socket> channelSubscribers =
+                                subscribers.get(channel);
+
+                        if (channelSubscribers != null) {
+
+                            channelSubscribers.remove(client);
+
+                            if (channelSubscribers.isEmpty()) {
+                                subscribers.remove(channel);
+                            }
+                        }
+
+                        String response =
+                                "*3\r\n" +
+                                        encodeBulkString("unsubscribe") +
+                                        encodeBulkString(channel) +
+                                        ":" + channels.size() + "\r\n";
+
+                        write(client, response);
+                    }
+                }else if (command.equalsIgnoreCase("PUNSUBSCRIBE")) {
+
+                    Set<String> patterns =
+                            clientPatternSubscriptions.get(client);
+
+                    if (patterns == null) {
+                        patterns =
+                                ConcurrentHashMap.newKeySet();
+
+                        clientPatternSubscriptions.put(
+                                client,
+                                patterns
+                        );
+                    }
+
+                    // No arguments = unsubscribe from all patterns.
+                    if (arguments.length == 1) {
+
+                        for (String pattern :
+                                new ArrayList<>(patterns)) {
+
+                            patterns.remove(pattern);
+
+                            Set<Socket> patternClients =
+                                    patternSubscribers.get(pattern);
+
+                            if (patternClients != null) {
+
+                                patternClients.remove(client);
+
+                                if (patternClients.isEmpty()) {
+                                    patternSubscribers.remove(pattern);
+                                }
+                            }
+
+                            String response =
+                                    "*3\r\n" +
+                                            encodeBulkString("punsubscribe") +
+                                            encodeBulkString(pattern) +
+                                            ":" + patterns.size() + "\r\n";
+
+                            write(client, response);
+                        }
+
+                        if (patterns.isEmpty()) {
+                            write(
+                                    client,
+                                    "*3\r\n" +
+                                            encodeBulkString("punsubscribe") +
+                                            "$-1\r\n" +
+                                            ":0\r\n"
+                            );
+                        }
+
+                        continue;
+                    }
+
+                    for (int i = 1; i < arguments.length; i++) {
+
+                        String pattern = arguments[i];
+
+                        patterns.remove(pattern);
+
+                        Set<Socket> patternClients =
+                                patternSubscribers.get(pattern);
+
+                        if (patternClients != null) {
+
+                            patternClients.remove(client);
+
+                            if (patternClients.isEmpty()) {
+                                patternSubscribers.remove(pattern);
+                            }
+                        }
+
+                        String response =
+                                "*3\r\n" +
+                                        encodeBulkString("punsubscribe") +
+                                        encodeBulkString(pattern) +
+                                        ":" + patterns.size() + "\r\n";
+
+                        write(client, response);
+                    }
+                }
+
+// -------------------------
+// PING
+// -------------------------
                 else if (command.equalsIgnoreCase("PING")) {
 
-                    write(client, "+PONG\r\n");
+                    if (clientSubscriptions.get(client) != null &&
+                            !clientSubscriptions.get(client).isEmpty()) {
+
+                        write(
+                                client,
+                                "*2\r\n" +
+                                        encodeBulkString("pong") +
+                                        encodeBulkString("")
+                        );
+
+                    } else {
+
+                        write(client, "+PONG\r\n");
+                    }
+
+                } else if (command.equalsIgnoreCase("PUBLISH")) {
+
+                    if (arguments.length != 3) {
+                        write(client, "-ERR wrong number of arguments\r\n");
+                        continue;
+                    }
+
+                    String channel = arguments[1];
+                    String message = arguments[2];
+
+                    Set<Socket> recipients =
+                            ConcurrentHashMap.newKeySet();
+
+                    // Direct subscribers
+                    Set<Socket> channelSubscribers =
+                            subscribers.get(channel);
+
+                    if (channelSubscribers != null) {
+                        recipients.addAll(channelSubscribers);
+                    }
+
+                    // Pattern subscribers
+                    for (Map.Entry<String, Set<Socket>> entry :
+                            patternSubscribers.entrySet()) {
+
+                        String pattern = entry.getKey();
+
+                        if (globMatches(pattern, channel)) {
+                            recipients.addAll(entry.getValue());
+                        }
+                    }
+
+                    for (Socket subscriber : recipients) {
+
+                        // Direct subscription
+                        Set<String> directSubscriptions =
+                                clientSubscriptions.get(subscriber);
+
+                        if (directSubscriptions != null
+                                && directSubscriptions.contains(channel)) {
+
+                            String response =
+                                    "*3\r\n" +
+                                            encodeBulkString("message") +
+                                            encodeBulkString(channel) +
+                                            encodeBulkString(message);
+
+                            try {
+                                write(subscriber, response);
+                            } catch (IOException ignored) {
+                            }
+
+                            continue;
+                        }
+
+                        // Pattern subscription
+                        Set<String> patterns =
+                                clientPatternSubscriptions.get(subscriber);
+
+                        if (patterns != null) {
+
+                            for (String pattern : patterns) {
+
+                                if (globMatches(pattern, channel)) {
+
+                                    String response =
+                                            "*4\r\n" +
+                                                    encodeBulkString("pmessage") +
+                                                    encodeBulkString(pattern) +
+                                                    encodeBulkString(channel) +
+                                                    encodeBulkString(message);
+
+                                    try {
+                                        write(subscriber, response);
+                                    } catch (IOException ignored) {
+                                    }
+
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    write(
+                            client,
+                            ":" + recipients.size() + "\r\n"
+                    );
                 }
 
                 else if (command.equalsIgnoreCase("REPLCONF")) {
@@ -908,8 +1976,7 @@ public class Main {
                     } else {
                         write(client, "+OK\r\n");
                     }
-                }
-                else if (command.equalsIgnoreCase("PSYNC")) {
+                } else if (command.equalsIgnoreCase("PSYNC")) {
 
                     String response =
                             "+FULLRESYNC " +
@@ -933,8 +2000,7 @@ public class Main {
 
                     writeBytes(client, EMPTY_RDB);
 
-                }
-                else if (command.equalsIgnoreCase("WAIT")) {
+                } else if (command.equalsIgnoreCase("WAIT")) {
 
                     if (arguments.length != 3) {
                         write(client, "-ERR wrong number of arguments\r\n");
@@ -1068,6 +2134,7 @@ public class Main {
 
                     store.put(key, value);
                     markKeyModified(key);
+
                     if (!isReplica) {
                         propagateCommand(arguments);
                     }
@@ -1088,7 +2155,44 @@ public class Main {
                         expiryTimes.remove(key);
                     }
 
+                    appendAofCommand(arguments);
+
                     write(client, "+OK\r\n");
+                } else if (command.equalsIgnoreCase("KEYS")) {
+
+                    if (arguments.length != 2) {
+                        write(client, "-ERR wrong number of arguments\r\n");
+                        continue;
+                    }
+
+                    if (!arguments[1].equals("*")) {
+                        write(client, "*0\r\n");
+                        continue;
+                    }
+
+                    for (String key : new ArrayList<>(store.keySet())) {
+
+                        Long expiryTime = expiryTimes.get(key);
+
+                        if (expiryTime != null &&
+                                System.currentTimeMillis() >= expiryTime) {
+
+                            store.remove(key);
+                            expiryTimes.remove(key);
+                        }
+                    }
+
+                    StringBuilder response = new StringBuilder();
+
+                    response.append("*")
+                            .append(store.size())
+                            .append("\r\n");
+
+                    for (String key : store.keySet()) {
+                        response.append(encodeBulkString(key));
+                    }
+
+                    write(client, response.toString());
                 }
 
                 // -------------------------
@@ -1138,6 +2242,8 @@ public class Main {
                             propagateCommand(arguments);
                         }
 
+                        appendAofCommand(arguments);
+
                         write(client, ":1\r\n");
                         continue;
                     }
@@ -1164,9 +2270,303 @@ public class Main {
                         write(client,
                                 "-ERR value is not an integer or out of range\r\n");
                     }
-                }
+                } else if (command.equalsIgnoreCase("ZADD")) {
 
-                else if (command.equalsIgnoreCase("TYPE")) {
+                    if (arguments.length < 4 ||
+                            (arguments.length - 2) % 2 != 0) {
+
+                        write(client,
+                                "-ERR wrong number of arguments\r\n");
+                        continue;
+                    }
+
+                    String key = arguments[1];
+
+                    sortedSets.putIfAbsent(
+                            key,
+                            new ConcurrentHashMap<>()
+                    );
+
+                    Map<String, Double> sortedSet =
+                            sortedSets.get(key);
+
+                    int newMembers = 0;
+
+                    try {
+
+                        for (int i = 2; i < arguments.length; i += 2) {
+
+                            double score =
+                                    Double.parseDouble(arguments[i]);
+
+                            String member = arguments[i + 1];
+
+                            if (!sortedSet.containsKey(member)) {
+                                newMembers++;
+                            }
+
+                            sortedSet.put(member, score);
+                        }
+
+                        write(
+                                client,
+                                ":" + newMembers + "\r\n"
+                        );
+
+                    } catch (NumberFormatException e) {
+
+                        write(
+                                client,
+                                "-ERR value is not a valid float\r\n"
+                        );
+                    }
+
+                } else if (command.equalsIgnoreCase("ZRANK")) {
+
+                    if (arguments.length != 3) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+                    String member = arguments[2];
+
+                    Map<String, Double> sortedSet =
+                            sortedSets.get(key);
+
+                    if (sortedSet == null ||
+                            !sortedSet.containsKey(member)) {
+
+                        write(client, "$-1\r\n");
+                        continue;
+                    }
+
+                    List<String> members =
+                            new ArrayList<>(sortedSet.keySet());
+
+                    members.sort((a, b) -> {
+
+                        int scoreComparison =
+                                Double.compare(
+                                        sortedSet.get(a),
+                                        sortedSet.get(b)
+                                );
+
+                        if (scoreComparison != 0) {
+                            return scoreComparison;
+                        }
+
+                        return a.compareTo(b);
+                    });
+
+                    int rank =
+                            members.indexOf(member);
+
+                    write(
+                            client,
+                            ":" + rank + "\r\n"
+                    );
+
+                } else if (command.equalsIgnoreCase("ZRANGE")) {
+
+                    if (arguments.length != 4) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+
+                    int start;
+                    int stop;
+
+                    try {
+
+                        start =
+                                Integer.parseInt(arguments[2]);
+
+                        stop =
+                                Integer.parseInt(arguments[3]);
+
+                    } catch (NumberFormatException e) {
+
+                        write(
+                                client,
+                                "-ERR value is not an integer\r\n"
+                        );
+                        continue;
+                    }
+
+                    Map<String, Double> sortedSet =
+                            sortedSets.get(key);
+
+                    if (sortedSet == null ||
+                            sortedSet.isEmpty()) {
+
+                        write(client, "*0\r\n");
+                        continue;
+                    }
+
+                    List<String> members =
+                            new ArrayList<>(sortedSet.keySet());
+
+                    members.sort((a, b) -> {
+
+                        int scoreComparison =
+                                Double.compare(
+                                        sortedSet.get(a),
+                                        sortedSet.get(b)
+                                );
+
+                        if (scoreComparison != 0) {
+                            return scoreComparison;
+                        }
+
+                        return a.compareTo(b);
+                    });
+
+                    int size = members.size();
+
+                    // Convert negative indexes.
+                    if (start < 0) {
+                        start = size + start;
+
+                        if (start < 0) {
+                            start = 0;
+                        }
+                    }
+
+                    if (stop < 0) {
+                        stop = size + stop;
+
+                        if (stop < 0) {
+                            stop = 0;
+                        }
+                    }
+
+                    if (start >= size ||
+                            start > stop) {
+
+                        write(client, "*0\r\n");
+                        continue;
+                    }
+
+                    int end =
+                            Math.min(stop, size - 1);
+
+                    StringBuilder response =
+                            new StringBuilder();
+
+                    response.append("*")
+                            .append(end - start + 1)
+                            .append("\r\n");
+
+                    for (int i = start; i <= end; i++) {
+
+                        response.append(
+                                encodeBulkString(
+                                        members.get(i)
+                                )
+                        );
+                    }
+
+                    write(client, response.toString());
+
+                } else if (command.equalsIgnoreCase("ZCARD")) {
+
+                    if (arguments.length != 2) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+
+                    Map<String, Double> sortedSet =
+                            sortedSets.get(key);
+
+                    if (sortedSet == null) {
+                        write(client, ":0\r\n");
+                    } else {
+                        write(
+                                client,
+                                ":" + sortedSet.size() + "\r\n"
+                        );
+                    }
+
+                } else if (command.equalsIgnoreCase("ZSCORE")) {
+
+                    if (arguments.length != 3) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+                    String member = arguments[2];
+
+                    Map<String, Double> sortedSet =
+                            sortedSets.get(key);
+
+                    if (sortedSet == null ||
+                            !sortedSet.containsKey(member)) {
+
+                        write(client, "$-1\r\n");
+                        continue;
+                    }
+
+                    String score =
+                            String.valueOf(sortedSet.get(member));
+
+                    write(
+                            client,
+                            encodeBulkString(score)
+                    );
+
+                } else if (command.equalsIgnoreCase("ZREM")) {
+
+                    if (arguments.length != 3) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+                    String member = arguments[2];
+
+                    Map<String, Double> sortedSet =
+                            sortedSets.get(key);
+
+                    if (sortedSet == null) {
+                        write(client, ":0\r\n");
+                        continue;
+                    }
+
+                    if (sortedSet.remove(member) != null) {
+
+                        if (sortedSet.isEmpty()) {
+                            sortedSets.remove(key);
+                        }
+
+                        write(client, ":1\r\n");
+
+                    } else {
+
+                        write(client, ":0\r\n");
+                    }
+
+                } else if (command.equalsIgnoreCase("TYPE")) {
 
                     String key = arguments[1];
 
@@ -1310,51 +2710,51 @@ public class Main {
                 // -------------------------
                 else if (command.equalsIgnoreCase("RPUSH")) {
 
-                if (arguments.length < 3) {
-                    write(client, "-ERR wrong number of arguments\r\n");
-                    continue;
-                }
+                    if (arguments.length < 3) {
+                        write(client, "-ERR wrong number of arguments\r\n");
+                        continue;
+                    }
 
-                String key = arguments[1];
+                    String key = arguments[1];
 
-                lists.putIfAbsent(key, new ArrayList<>());
-                blockedClients.putIfAbsent(key, new ArrayDeque<>());
+                    lists.putIfAbsent(key, new ArrayList<>());
+                    blockedClients.putIfAbsent(key, new ArrayDeque<>());
 
-                List<String> list = lists.get(key);
-                Deque<BlockedClient> waiters = blockedClients.get(key);
+                    List<String> list = lists.get(key);
+                    Deque<BlockedClient> waiters = blockedClients.get(key);
 
-                int pushedCount = arguments.length - 2;
+                    int pushedCount = arguments.length - 2;
 
-                synchronized (waiters) {
+                    synchronized (waiters) {
 
-                    for (int i = 2; i < arguments.length; i++) {
+                        for (int i = 2; i < arguments.length; i++) {
 
-                        String value = arguments[i];
+                            String value = arguments[i];
 
-                        if (!waiters.isEmpty()) {
+                            if (!waiters.isEmpty()) {
 
-                            // Give the value directly to the oldest blocked client.
-                            BlockedClient blocked = waiters.pollFirst();
-                            blocked.future.complete(value);
+                                // Give the value directly to the oldest blocked client.
+                                BlockedClient blocked = waiters.pollFirst();
+                                blocked.future.complete(value);
 
-                        } else {
+                            } else {
 
-                            // No blocked client, so keep it in the list.
-                            list.add(value);
+                                // No blocked client, so keep it in the list.
+                                list.add(value);
+                            }
                         }
                     }
-                }
 
-                /*
-                 * Number of elements that remain in the list after RPUSH,
-                 * plus elements that were immediately delivered to blocked clients.
-                 */
-                int resultLength = list.size() + pushedCount;
+                    /*
+                     * Number of elements that remain in the list after RPUSH,
+                     * plus elements that were immediately delivered to blocked clients.
+                     */
+                    int resultLength = list.size() + pushedCount;
 
-                write(
-                        client,
-                        ":" + resultLength + "\r\n"
-                );
+                    write(
+                            client,
+                            ":" + resultLength + "\r\n"
+                    );
                 }
 
                 // -------------------------
@@ -2047,8 +3447,75 @@ public class Main {
                             client,
                             response
                     );
-                }
-                else if (command.equalsIgnoreCase("INFO")) {
+                } else if (command.equalsIgnoreCase("CONFIG")) {
+
+                    if (arguments.length != 3
+                            || !arguments[1].equalsIgnoreCase("GET")) {
+
+                        write(client, "-ERR wrong number of arguments\r\n");
+                        continue;
+                    }
+
+                    String parameter = arguments[2];
+
+                    if (parameter.equalsIgnoreCase("dir")) {
+
+                        write(
+                                client,
+                                "*2\r\n" +
+                                        encodeBulkString("dir") +
+                                        encodeBulkString(rdbDir)
+                        );
+
+                    } else if (parameter.equalsIgnoreCase("dbfilename")) {
+
+                        write(
+                                client,
+                                "*2\r\n" +
+                                        encodeBulkString("dbfilename") +
+                                        encodeBulkString(rdbFilename)
+                        );
+
+                    } else if (parameter.equalsIgnoreCase("appendonly")) {
+
+                        write(
+                                client,
+                                "*2\r\n" +
+                                        encodeBulkString("appendonly") +
+                                        encodeBulkString(appendOnly)
+                        );
+
+                    } else if (parameter.equalsIgnoreCase("appenddirname")) {
+
+                        write(
+                                client,
+                                "*2\r\n" +
+                                        encodeBulkString("appenddirname") +
+                                        encodeBulkString(appendDirName)
+                        );
+
+                    } else if (parameter.equalsIgnoreCase("appendfilename")) {
+
+                        write(
+                                client,
+                                "*2\r\n" +
+                                        encodeBulkString("appendfilename") +
+                                        encodeBulkString(appendFileName)
+                        );
+
+                    } else if (parameter.equalsIgnoreCase("appendfsync")) {
+
+                        write(
+                                client,
+                                "*2\r\n" +
+                                        encodeBulkString("appendfsync") +
+                                        encodeBulkString(appendFsync)
+                        );
+                    } else {
+
+                        write(client, "*0\r\n");
+                    }
+                } else if (command.equalsIgnoreCase("INFO")) {
 
                     if (arguments.length >= 2 &&
                             arguments[1].equalsIgnoreCase("replication")) {
@@ -2093,10 +3560,51 @@ public class Main {
                     "Client error: " + e.getMessage()
             );
 
-        }finally {
+        } finally {
 
             replicas.remove(client);
             replicaAckOffsets.remove(client);
+
+            Set<String> channels =
+                    clientSubscriptions.remove(client);
+
+            if (channels != null) {
+
+                for (String channel : channels) {
+
+                    Set<Socket> channelSubscribers =
+                            subscribers.get(channel);
+
+                    if (channelSubscribers != null) {
+
+                        channelSubscribers.remove(client);
+
+                        if (channelSubscribers.isEmpty()) {
+                            subscribers.remove(channel);
+                        }
+                    }
+                }
+            }
+            Set<String> patterns =
+                    clientPatternSubscriptions.remove(client);
+
+            if (patterns != null) {
+
+                for (String pattern : patterns) {
+
+                    Set<Socket> patternClients =
+                            patternSubscribers.get(pattern);
+
+                    if (patternClients != null) {
+
+                        patternClients.remove(client);
+
+                        if (patternClients.isEmpty()) {
+                            patternSubscribers.remove(pattern);
+                        }
+                    }
+                }
+            }
 
             try {
                 client.close();
