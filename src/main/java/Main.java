@@ -1274,6 +1274,8 @@ public class Main {
             InputStream input = client.getInputStream();
             boolean inTransaction = false;
             boolean replicationConnection = false;
+            boolean authenticated =
+                    !Authentication.requiresAuthentication();
 
             List<TransactionCommand> transactionQueue =
                     new ArrayList<>();
@@ -1308,6 +1310,56 @@ public class Main {
                 }
 
                 String command = arguments[0];
+                // -------------------------
+// AUTH
+// -------------------------
+                if (command.equalsIgnoreCase("AUTH")) {
+
+                    if (arguments.length != 3) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String username = arguments[1];
+                    String password = arguments[2];
+
+                    if (Authentication.authenticate(
+                            username,
+                            password
+                    )) {
+
+                        authenticated = true;
+
+                        write(
+                                client,
+                                "+OK\r\n"
+                        );
+
+                    } else {
+
+                        write(
+                                client,
+                                "-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+                        );
+                    }
+
+                    continue;
+                }
+                // -------------------------
+// Authentication required
+// -------------------------
+                if (!authenticated) {
+
+                    write(
+                            client,
+                            "-NOAUTH Authentication required.\r\n"
+                    );
+
+                    continue;
+                }
                 if (inTransaction &&
                         !command.equalsIgnoreCase("MULTI") &&
                         !command.equalsIgnoreCase("EXEC") &&
@@ -1345,8 +1397,155 @@ public class Main {
 
                     continue;
                 }
+                // -------------------------
+// ACL
+// -------------------------
+                if (command.equalsIgnoreCase("ACL")) {
 
-                if (command.equalsIgnoreCase("WATCH")) {
+                    if (arguments.length < 2) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String subcommand = arguments[1];
+
+                    // -------------------------
+                    // ACL WHOAMI
+                    // -------------------------
+                    if (subcommand.equalsIgnoreCase("WHOAMI")) {
+
+                        if (!authenticated) {
+                            write(
+                                    client,
+                                    "-NOAUTH Authentication required.\r\n"
+                            );
+                            continue;
+                        }
+
+                        if (arguments.length != 2) {
+                            write(
+                                    client,
+                                    "-ERR wrong number of arguments\r\n"
+                            );
+                            continue;
+                        }
+
+                        write(
+                                client,
+                                encodeBulkString(
+                                        Authentication.whoAmI()
+                                )
+                        );
+                    }
+
+                    // -------------------------
+                    // ACL GETUSER
+                    // -------------------------
+                    else if (subcommand.equalsIgnoreCase("GETUSER")) {
+
+                        if (!authenticated) {
+                            write(
+                                    client,
+                                    "-NOAUTH Authentication required.\r\n"
+                            );
+                            continue;
+                        }
+
+                        if (arguments.length != 3) {
+                            write(
+                                    client,
+                                    "-ERR wrong number of arguments\r\n"
+                            );
+                            continue;
+                        }
+
+                        if (!arguments[2].equals("default")) {
+                            write(
+                                    client,
+                                    "$-1\r\n"
+                            );
+                            continue;
+                        }
+
+                        write(
+                                client,
+                                Authentication.getDefaultUserResponse()
+                        );
+                    }
+
+                    // -------------------------
+                    // ACL SETUSER
+                    // -------------------------
+                    else if (subcommand.equalsIgnoreCase("SETUSER")) {
+
+                        if (!authenticated) {
+                            write(
+                                    client,
+                                    "-NOAUTH Authentication required.\r\n"
+                            );
+                            continue;
+                        }
+
+                        if (arguments.length != 4) {
+                            write(
+                                    client,
+                                    "-ERR wrong number of arguments\r\n"
+                            );
+                            continue;
+                        }
+
+                        String username = arguments[2];
+                        String rule = arguments[3];
+
+                        if (!username.equals("default")) {
+                            write(
+                                    client,
+                                    "-ERR user does not exist\r\n"
+                            );
+                            continue;
+                        }
+
+                        if (rule.startsWith(">")) {
+
+                            String password =
+                                    rule.substring(1);
+
+                            Authentication.setDefaultPassword(
+                                    password
+                            );
+
+                            // Existing connection remains authenticated.
+                            authenticated = true;
+
+                            write(
+                                    client,
+                                    "+OK\r\n"
+                            );
+
+                        } else {
+
+                            write(
+                                    client,
+                                    "-ERR unsupported ACL SETUSER rule\r\n"
+                            );
+                        }
+                    }
+
+                    else {
+
+                        write(
+                                client,
+                                "-ERR unknown ACL subcommand\r\n"
+                        );
+                    }
+
+                    continue;
+                }
+
+                else if (command.equalsIgnoreCase("WATCH")) {
 
                     if (inTransaction) {
                         write(client,
