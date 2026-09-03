@@ -99,6 +99,9 @@ public class Main {
     private static final Map<String, Map<String, Double>> sortedSets =
             new ConcurrentHashMap<>();
 
+    private static final Set<String> geoKeys =
+            ConcurrentHashMap.newKeySet();
+
     private static final Object xreadLock = new Object();
 
     private static final Map<String, Deque<BlockedClient>> blockedClients =
@@ -2270,7 +2273,308 @@ public class Main {
                         write(client,
                                 "-ERR value is not an integer or out of range\r\n");
                     }
-                } else if (command.equalsIgnoreCase("ZADD")) {
+                    // -------------------------
+// GEOADD
+// -------------------------
+                } else if (command.equalsIgnoreCase("GEOADD")) {
+
+                    if (arguments.length != 5) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+
+                    double longitude;
+                    double latitude;
+
+                    try {
+                        longitude = Double.parseDouble(arguments[2]);
+                        latitude = Double.parseDouble(arguments[3]);
+                    } catch (NumberFormatException e) {
+                        write(
+                                client,
+                                "-ERR invalid longitude,latitude pair\r\n"
+                        );
+                        continue;
+                    }
+
+                    String validationError =
+                            Geospatial.validateCoordinates(
+                                    longitude,
+                                    latitude
+                            );
+
+                    if (validationError != null) {
+                        write(client, validationError);
+                        continue;
+                    }
+
+                    double score =
+                            Geospatial.calculateScore(
+                                    longitude,
+                                    latitude
+                            );
+
+                    sortedSets.putIfAbsent(
+                            key,
+                            new ConcurrentHashMap<>()
+                    );
+
+                    Map<String, Double> sortedSet =
+                            sortedSets.get(key);
+
+                    String member = arguments[4];
+
+                    boolean isNew =
+                            !sortedSet.containsKey(member);
+
+                    sortedSet.put(member, score);
+                    geoKeys.add(key);
+
+                    write(
+                            client,
+                            ":" + (isNew ? 1 : 0) + "\r\n"
+                    );
+                    // -------------------------
+// GEOPOS
+// -------------------------
+                } else if (command.equalsIgnoreCase("GEOPOS")) {
+
+                    if (arguments.length < 3) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+
+                    Map<String, Double> sortedSet =
+                            sortedSets.get(key);
+
+                    StringBuilder response =
+                            new StringBuilder();
+
+                    response.append("*")
+                            .append(arguments.length - 2)
+                            .append("\r\n");
+
+                    for (int i = 2; i < arguments.length; i++) {
+
+                        String member = arguments[i];
+
+                        if (sortedSet == null ||
+                                !sortedSet.containsKey(member)) {
+
+                            response.append("*-1\r\n");
+                            continue;
+                        }
+
+                        double score =
+                                sortedSet.get(member);
+
+                        double[] coordinates =
+                                Geospatial.decodeScore(score);
+
+                        response.append("*2\r\n");
+
+                        response.append(
+                                encodeBulkString(
+                                        String.valueOf(coordinates[0])
+                                )
+                        );
+
+                        response.append(
+                                encodeBulkString(
+                                        String.valueOf(coordinates[1])
+                                )
+                        );
+                    }
+
+                    write(client, response.toString());
+                    // -------------------------
+// GEODIST
+// -------------------------
+                } else if (command.equalsIgnoreCase("GEODIST")) {
+
+                    if (arguments.length < 4 ||
+                            arguments.length > 5) {
+
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+                    String member1 = arguments[2];
+                    String member2 = arguments[3];
+
+                    Map<String, Double> sortedSet =
+                            sortedSets.get(key);
+
+                    if (sortedSet == null ||
+                            !sortedSet.containsKey(member1) ||
+                            !sortedSet.containsKey(member2)) {
+
+                        write(client, "$-1\r\n");
+                        continue;
+                    }
+
+                    double score1 =
+                            sortedSet.get(member1);
+
+                    double score2 =
+                            sortedSet.get(member2);
+
+                    double[] coordinates1 =
+                            Geospatial.decodeScore(score1);
+
+                    double[] coordinates2 =
+                            Geospatial.decodeScore(score2);
+
+                    double distance =
+                            Geospatial.distanceMeters(
+                                    coordinates1[0],
+                                    coordinates1[1],
+                                    coordinates2[0],
+                                    coordinates2[1]
+                            );
+
+                    if (arguments.length == 5) {
+                        String unit = arguments[4];
+
+                        if (unit.equalsIgnoreCase("km")) {
+                            distance /= 1000.0;
+                        } else if (unit.equalsIgnoreCase("mi")) {
+                            distance /= 1609.344;
+                        } else if (unit.equalsIgnoreCase("ft")) {
+                            distance /= 0.3048;
+                        }
+                    }
+
+                    write(
+                            client,
+                            encodeBulkString(
+                                    String.valueOf(distance)
+                            )
+                    );
+                    // -------------------------
+// GEOSEARCH
+// -------------------------
+                } else if (command.equalsIgnoreCase("GEOSEARCH")) {
+
+                    if (arguments.length != 8) {
+                        write(
+                                client,
+                                "-ERR wrong number of arguments\r\n"
+                        );
+                        continue;
+                    }
+
+                    String key = arguments[1];
+
+                    if (!arguments[2].equalsIgnoreCase("FROMLONLAT")
+                            || !arguments[5].equalsIgnoreCase("BYRADIUS")) {
+
+                        write(
+                                client,
+                                "-ERR unsupported GEOSEARCH options\r\n"
+                        );
+                        continue;
+                    }
+
+                    double centerLongitude;
+                    double centerLatitude;
+                    double radius;
+
+                    try {
+
+                        centerLongitude =
+                                Double.parseDouble(arguments[3]);
+
+                        centerLatitude =
+                                Double.parseDouble(arguments[4]);
+
+                        radius =
+                                Double.parseDouble(arguments[6]);
+
+                    } catch (NumberFormatException e) {
+
+                        write(
+                                client,
+                                "-ERR invalid numeric argument\r\n"
+                        );
+                        continue;
+                    }
+
+                    String unit = arguments[7];
+
+                    double radiusMeters =
+                            Geospatial.radiusToMeters(
+                                    radius,
+                                    unit
+                            );
+
+                    Map<String, Double> sortedSet =
+                            sortedSets.get(key);
+
+                    if (sortedSet == null ||
+                            sortedSet.isEmpty()) {
+
+                        write(client, "*0\r\n");
+                        continue;
+                    }
+
+                    List<String> matches =
+                            new ArrayList<>();
+
+                    for (Map.Entry<String, Double> entry :
+                            sortedSet.entrySet()) {
+
+                        double score =
+                                entry.getValue();
+
+                        double[] coordinates =
+                                Geospatial.decodeScore(score);
+
+                        double distance =
+                                Geospatial.distanceMeters(
+                                        centerLongitude,
+                                        centerLatitude,
+                                        coordinates[0],
+                                        coordinates[1]
+                                );
+
+                        if (distance <= radiusMeters) {
+                            matches.add(entry.getKey());
+                        }
+                    }
+
+                    StringBuilder response =
+                            new StringBuilder();
+
+                    response.append("*")
+                            .append(matches.size())
+                            .append("\r\n");
+
+                    for (String member : matches) {
+
+                        response.append(
+                                encodeBulkString(member)
+                        );
+                    }
+
+                    write(client, response.toString());
+                }
+
+                else if (command.equalsIgnoreCase("ZADD")) {
 
                     if (arguments.length < 4 ||
                             (arguments.length - 2) % 2 != 0) {
@@ -2524,8 +2828,24 @@ public class Main {
                         continue;
                     }
 
-                    String score =
-                            String.valueOf(sortedSet.get(member));
+                    double scoreValue =
+                            sortedSet.get(member);
+
+                    String score;
+
+                    if (geoKeys.contains(key)
+                            && scoreValue == Math.rint(scoreValue)) {
+
+                        score =
+                                String.valueOf(
+                                        (long) scoreValue
+                                );
+
+                    } else {
+
+                        score =
+                                String.valueOf(scoreValue);
+                    }
 
                     write(
                             client,
